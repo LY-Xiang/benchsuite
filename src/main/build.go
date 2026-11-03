@@ -226,7 +226,7 @@ func (e *Env) BuildGo(src, registryPath string) (string, error) {
 	}
 
 	digest := sha256.New()
-	digest.Write(body)
+	digest.Write(normaliseNewlines(body))
 	digest.Write([]byte("\x00"))
 	vocabulary, err := genlibSourceDigest()
 	if err != nil {

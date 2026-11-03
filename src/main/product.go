@@ -1,10 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,25 +33,36 @@ func binaryFor(src string) string {
 // productHash is the digest of everything a compiled binary depends on: the
 // source bytes and the flags it was compiled with. Changing either must change
 // the hash, or a rebuilt binary would be adopted as if it were still current.
+//
+// Line endings are normalised to LF before hashing. A corpus checked out with
+// autocrlf converts every file, so the same source would otherwise hash
+// differently on two machines and each would rebuild what the other just built.
+// The compiler does not care about the difference, so neither should the key.
 func productHash(src string, flags []string) (string, error) {
-	digest := sha256.New()
-	if err := digestFile(digest, src); err != nil {
+	body, err := os.ReadFile(src)
+	if err != nil {
 		return "", err
 	}
+	digest := sha256.New()
+	digest.Write(normaliseNewlines(body))
 	digest.Write([]byte("\x00" + strings.Join(flags, "\x00")))
 	return hex.EncodeToString(digest.Sum(nil)), nil
 }
 
-// digestFile streams a file into a digest rather than reading it whole: a source
-// may be large, and hashing it must not load it into memory.
-func digestFile(digest io.Writer, path string) error {
-	file, err := os.Open(path)
-	if err != nil {
-		return err
+// normaliseNewlines strips the CR of a CRLF pair, leaving LF. A CR that is not
+// followed by LF is content and is kept.
+func normaliseNewlines(body []byte) []byte {
+	if !bytes.ContainsRune(body, '\r') {
+		return body
 	}
-	defer func() { _ = file.Close() }()
-	_, err = io.Copy(digest, file)
-	return err
+	out := make([]byte, 0, len(body))
+	for i := 0; i < len(body); i++ {
+		if body[i] == '\r' && i+1 < len(body) && body[i+1] == '\n' {
+			continue
+		}
+		out = append(out, body[i])
+	}
+	return out
 }
 
 // buildProduct compiles a source into the product beside it, reusing the
