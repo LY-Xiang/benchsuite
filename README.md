@@ -40,8 +40,24 @@ Flags: `-L check|verify|bench` (repeatable), `-R <regex>`, `--reps <n>`,
 
 Exit codes: `0` success, `1` a case failed, `2` a usage or registry error.
 
-The binary cache is written to `<corpus>/.bench/bin`, and can be deleted at any
-time — entries are content-addressed and rebuild on demand.
+## The binary cache
+
+Each source is compiled to a binary beside it: `2267/A.cpp` yields `2267/A.exe`,
+and a reference at `2267/refs/2267A.cpp` yields `2267/refs/2267A.exe`. Nothing
+is built ahead of time -- the binary appears when it is first needed.
+
+The registry records the hash of what was compiled, so a later run can tell
+whether the binary still matches:
+
+```toml
+[A]
+maxgen = "letters %S 25"
+hash = { "2267/A.exe" = "3f2a...", "2267/refs/2267A.cpp" = "9c81..." }
+```
+
+The hash covers the source bytes and the compile flags, so editing either
+rebuilds the binary. The binaries are not in version control; deleting one only
+costs the next rebuild.
 
 ## The three shapes
 

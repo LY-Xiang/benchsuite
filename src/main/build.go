@@ -3,11 +3,8 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
-	"io"
 	"io/fs"
-	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,9 +27,8 @@ const CompileTimeout = 5 * time.Minute
 // Env carries everything one run needs: the checkout it works against, the
 // compiler command, and the binary cache.
 type Env struct {
-	Root     string   // repo root
-	CXX      []string // shell-split compiler command
-	CacheDir string
+	Root string   // repo root
+	CXX  []string // shell-split compiler command
 }
 
 func NewEnv(root string) *Env {
@@ -41,9 +37,8 @@ func NewEnv(root string) *Env {
 		cxx = shellSplit(raw)
 	}
 	return &Env{
-		Root:     root,
-		CXX:      cxx,
-		CacheDir: filepath.Join(root, ".bench", "bin"),
+		Root: root,
+		CXX:  cxx,
 	}
 }
 
@@ -56,30 +51,19 @@ func binarySuffix() string {
 	return ""
 }
 
-// Build compiles one source, reusing `.bench/bin/<key>` when the bytes and flags
-// match. The key is sha256(source || NUL || flags)[:16], so an unchanged source
-// compiles once per (content, flags). A miss compiles to a temporary file and is
+// compileTo compiles a source to an exact output path.
+//
+// The compiler writes to a temporary file beside the target and that file is
 // renamed into place, so a concurrent run never executes a half-written binary.
-func (e *Env) Build(src, out string, flags []string) bool {
-	digest := sha256.New()
-	if err := digestFile(digest, src, 0); err != nil {
-		return false
+// A source with no recorded hash -- a launch floor, a generator -- is compiled
+// here rather than through the product cache.
+func (e *Env) compileTo(src, out string, flags []string) (string, error) {
+	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
+		return "", err
 	}
-	digest.Write([]byte("\x00" + strings.Join(flags, "\x00")))
-	entry := filepath.Join(e.CacheDir, hex.EncodeToString(digest.Sum(nil))[:16]+binarySuffix())
-
-	if reused, ok := e.cachedBinary(entry, out); ok {
-		return reused
-	}
-	if !prepareCacheDirs(e.CacheDir, out) {
-		return false
-	}
-
-	// A per-build temporary name, so two concurrent runs never compile into the
-	// same path.
-	staged, err := os.CreateTemp(e.CacheDir, "bench-*.tmp")
+	staged, err := os.CreateTemp(filepath.Dir(out), filepath.Base(out)+".tmp-*")
 	if err != nil {
-		return false
+		return "", err
 	}
 	stagedPath := staged.Name()
 	defer func() { _ = os.Remove(stagedPath) }()
@@ -87,7 +71,7 @@ func (e *Env) Build(src, out string, flags []string) bool {
 	// close is a build failure. The remove above is only an attempt: on Windows
 	// a failed close usually leaves the handle open and removal fails.
 	if err := staged.Close(); err != nil {
-		return false
+		return "", err
 	}
 
 	argv := make([]string, 0, len(e.CXX)+len(flags)+3)
@@ -99,7 +83,7 @@ func (e *Env) Build(src, out string, flags []string) bool {
 	// its process group dies with it.
 	result := execpkg.Run(argv, nil, false, CompileTimeout)
 	if result.TimedOut || result.Code != 0 {
-		return false
+		return "", fmt.Errorf("compilation failed")
 	}
 	// A non-zero exit is the build failing; a warning is not. The compiler says
 	// so on stderr without changing its status, and a solution that compiles and
@@ -110,7 +94,10 @@ func (e *Env) Build(src, out string, flags []string) bool {
 	if len(result.Stderr) > 0 {
 		noteBuildOutput(src, argv, result.Stderr)
 	}
-	return e.installStaged(stagedPath, entry, out)
+	if err := os.Rename(stagedPath, out); err != nil {
+		return "", err
+	}
+	return out, nil
 }
 
 // buildNotes collects compiler diagnostics for sources that nonetheless built. It
@@ -149,195 +136,6 @@ func flushBuildNotes() {
 		}
 	}
 	buildNotes = nil
-}
-
-// cachedBinary reports whether entry is a verified hit. The bool says the caller
-// is done either way: true means a binary was installed, false with ok true means
-// the caller must return false. ok false means a miss, so it should build.
-func (e *Env) cachedBinary(entry, out string) (installed bool, ok bool) {
-	info, err := os.Stat(entry)
-	if err != nil || info.IsDir() || info.Size() == 0 {
-		return false, false
-	}
-	// A non-empty entry at the right name is not the same as an entry this harness
-	// produced. Verify it against what was recorded on install; a mismatch, a
-	// missing record or an oversized file is a miss, so the source is recompiled
-	// instead of an unverified binary being executed.
-	if cacheEntryIntact(e.CacheDir, entry) {
-		return installBinary(entry, out), true
-	}
-	_ = os.Remove(entry)
-	return false, false
-}
-
-// prepareCacheDirs creates the cache directory and the output's parent.
-func prepareCacheDirs(cacheDir, out string) bool {
-	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
-		return false
-	}
-	return os.MkdirAll(filepath.Dir(out), 0o755) == nil
-}
-
-// installStaged moves a freshly built binary into the cache and installs it at out.
-//
-// A staged file that is missing or empty is not a build failure: the compiler
-// exited cleanly, so gate 2 reports the missing binary and nothing is cached.
-func (e *Env) installStaged(stagedPath, entry, out string) bool {
-	if info, err := os.Stat(stagedPath); err != nil || info.Size() == 0 {
-		return true
-	}
-	if err := os.Rename(stagedPath, entry); err != nil {
-		// Another process won the race. Its bytes came from the same content
-		// hash, so adopt theirs.
-		if _, statErr := os.Stat(entry); statErr != nil {
-			return false
-		}
-	} else if digest, err := fileDigest(entry); err == nil {
-		recordEntryDigest(e.CacheDir, filepath.Base(entry), digest)
-	}
-	return installBinary(entry, out)
-}
-
-// maxCachedBinary bounds a cache entry the harness will adopt: generous for a
-// real binary, and small enough to refuse one padded into a memory hazard.
-const maxCachedBinary = 32 << 20 // 32 MiB
-
-// errCacheEntryTooLarge is a miss, not a crash: the entry is discarded and the
-// source recompiled.
-var errCacheEntryTooLarge = errors.New("cache entry is larger than any binary this harness builds")
-
-// fileDigest is the hex sha256 of a file's bytes, streamed rather than read
-// whole: the file is a cache entry, the one thing that may have been replaced
-// with a huge one, and verifying it must not load it into memory.
-func fileDigest(path string) (string, error) {
-	digest := sha256.New()
-	if err := digestFile(digest, path, maxCachedBinary+1); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(digest.Sum(nil)), nil
-}
-
-// digestFile streams a file into a digest. A non-zero ceiling reads at most that
-// many bytes and reports errCacheEntryTooLarge rather than hashing an oversized
-// entry in part; zero reads to EOF.
-func digestFile(digest io.Writer, path string, ceiling int64) error {
-	file, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = file.Close() }()
-	if ceiling == 0 {
-		_, err = io.Copy(digest, file)
-		return err
-	}
-	// One byte past the ceiling tells "at the limit" from "over it".
-	read, err := io.Copy(digest, io.LimitReader(file, ceiling))
-	if err != nil {
-		return err
-	}
-	if read >= ceiling {
-		return errCacheEntryTooLarge
-	}
-	return nil
-}
-
-// cacheManifest is where each installed entry's digest is recorded. It lives
-// beside the cache directory, not inside it: that listing is a characterized
-// contract of <16 hex><suffix> entry files, so a bookkeeping file there would
-// change it. The digest cannot ride in the entry's filename for the same reason.
-func cacheManifest(dir string) string {
-	return filepath.Join(filepath.Dir(dir), ".bench-cache.digest")
-}
-
-// readManifest parses the cache manifest into entry name -> digest. A missing or
-// unreadable manifest is an empty map: every entry then misses and recompiles.
-func readManifest(path string) map[string]string {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return map[string]string{}
-	}
-	entries := make(map[string]string)
-	for line := range strings.SplitSeq(string(raw), "\n") {
-		if key, value, ok := strings.Cut(line, " "); ok && key != "" {
-			entries[key] = value
-		}
-	}
-	return entries
-}
-
-// recordEntryDigest notes the digest of an entry just installed. A failed write
-// is not a build failure: the entry is still valid, the next hit merely
-// recompiles once because it cannot verify it.
-func recordEntryDigest(dir, name, digest string) {
-	path := cacheManifest(dir)
-	entries := readManifest(path)
-	entries[name] = digest
-
-	var out strings.Builder
-	for _, key := range slices.Sorted(maps.Keys(entries)) {
-		out.WriteString(key)
-		out.WriteByte(' ')
-		out.WriteString(entries[key])
-		out.WriteByte('\n')
-	}
-	// A failed write only costs a recompile later, so it is not an error.
-	_ = os.WriteFile(path, []byte(out.String()), 0o644)
-}
-
-// cacheEntryIntact reports whether an entry still hashes to what was recorded
-// when it was installed. No record, or bytes that no longer match, is a miss.
-//
-// This catches a corrupt, truncated or misplaced entry and stops a binary
-// dropped in under a guessed key from being adopted. It does not authenticate
-// against a writer who can also rewrite the manifest.
-func cacheEntryIntact(dir, path string) bool {
-	want := readManifest(cacheManifest(dir))[filepath.Base(path)]
-	if len(want) != 64 {
-		return false
-	}
-	got, err := fileDigest(path)
-	return err == nil && got == want
-}
-
-// installBinary makes out hold the cached binary, reporting whether a usable one
-// is there. A concurrent build renames the same content-hashed entry into place
-// and Windows refuses to open a file being replaced; the bytes are identical
-// either way, so a transient sharing violation is retried.
-func installBinary(entry, out string) bool {
-	for range installAttempts {
-		if installOnce(entry, out) {
-			return true
-		}
-		if _, err := os.Stat(entry); err != nil {
-			return false
-		}
-		time.Sleep(installRetry)
-	}
-	return false
-}
-
-const (
-	installAttempts = 50
-	installRetry    = 10 * time.Millisecond
-)
-
-func installOnce(entry, out string) bool {
-	if outInfo, err := os.Stat(out); err == nil && !outInfo.IsDir() {
-		if entryInfo, err := os.Stat(entry); err == nil && os.SameFile(outInfo, entryInfo) {
-			return true
-		}
-	}
-	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
-		return false
-	}
-	data, err := os.ReadFile(entry)
-	if err != nil {
-		return false
-	}
-	if err := os.WriteFile(out, data, 0o755); err != nil {
-		return false
-	}
-	return fileHasContent(out)
 }
 
 // fileHasContent reports whether path is a file with bytes in it. Gate 2 is this
@@ -416,7 +214,7 @@ func shellSplit(s string) []string {
 // last one, upgrading Go would reuse a binary the previous toolchain produced --
 // the exact case where the bytes on disk are no longer the bytes the source
 // describes.
-func (e *Env) BuildGo(src, out string) bool {
+func (e *Env) BuildGo(src, registryPath string) (string, error) {
 	absSrc := src
 	if !filepath.IsAbs(absSrc) {
 		absSrc = filepath.Join(e.Root, filepath.FromSlash(src))
@@ -424,7 +222,7 @@ func (e *Env) BuildGo(src, out string) bool {
 	body, err := os.ReadFile(absSrc)
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "go build: cannot read %s: %v\n", absSrc, err)
-		return false
+		return "", err
 	}
 
 	digest := sha256.New()
@@ -433,36 +231,38 @@ func (e *Env) BuildGo(src, out string) bool {
 	vocabulary, err := genlibSourceDigest()
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "go build: cannot read the embedded vocabulary: %v\n", err)
-		return false
+		return "", err
 	}
 	digest.Write([]byte("\x00"))
 	digest.Write(vocabulary)
 	digest.Write([]byte("\x00"))
 	digest.Write([]byte(goToolchainVersion()))
+	hash := hex.EncodeToString(digest.Sum(nil))
 
-	entry := filepath.Join(e.CacheDir, "go-"+hex.EncodeToString(digest.Sum(nil))[:16]+binarySuffix())
-	if reused, ok := e.cachedBinary(entry, out); ok {
-		return reused
+	// The generator is built beside its source, like any other product: a
+	// generator at 99001/gen.go yields 99001/gen.exe.
+	product := binaryFor(absSrc)
+	if reused, ok := e.productIntact(product, registryPath, hash); ok {
+		return reused, nil
 	}
-	if !prepareCacheDirs(e.CacheDir, out) {
-		return false
+	if err := os.MkdirAll(filepath.Dir(product), 0o755); err != nil {
+		return "", err
 	}
-
 	scratch, err := os.MkdirTemp("", "genplugin-*")
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "go build: cannot make a scratch module: %v\n", err)
-		return false
+		return "", err
 	}
 	defer func() { _ = os.RemoveAll(scratch) }()
 
 	if err := writeScratchModule(scratch, body); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "go build: %v\n", err)
-		return false
+		return "", err
 	}
 
-	staged, err := os.CreateTemp(e.CacheDir, "benchgo-*.tmp")
+	staged, err := os.CreateTemp(filepath.Dir(product), filepath.Base(product)+".tmp-*")
 	if err != nil {
-		return false
+		return "", err
 	}
 	stagedPath := staged.Name()
 	_ = staged.Close()
@@ -474,9 +274,17 @@ func (e *Env) BuildGo(src, out string) bool {
 		if len(result.Stderr) > 0 {
 			_, _ = fmt.Fprintf(os.Stderr, "go build: %s\n", strings.TrimSpace(string(result.Stderr)))
 		}
-		return false
+		return "", fmt.Errorf("generator did not compile")
 	}
-	return e.installStaged(stagedPath, entry, out)
+	if err := os.Rename(stagedPath, product); err != nil {
+		return "", err
+	}
+	if registryPath != "" {
+		// The generator is valid; only the record is missing, so the next run
+		// rebuilds once. That is not a build failure.
+		_ = recordProductHash(registryPath, e.relativeToRoot(product), hash)
+	}
+	return product, nil
 }
 
 // goToolchainVersion reports the version a `go build` here would use.

@@ -84,15 +84,23 @@ type Problem struct {
 	// rather than re-derived from Src, which may be overridden to a bare name.
 	Contest string // "2267"
 	TL      string // display only; the driver never enforces it
+	// Registry is the bench.toml that declared this problem. It is where the
+	// hash of the compiled product is recorded, so the binary beside the source
+	// can be checked against what was built from it.
+	Registry string
 }
 
 // allowedKeys is the key set each shape may declare. `check` is the full
 // vocabulary: a key outside every shape is unknown, one belonging only to another
 // shape is forbidden for this one.
+//
+// `hash` belongs to every shape because the harness writes it, not the author:
+// it records what was compiled, so a binary beside the source can be checked
+// against the source and the flags it was built from. It is never required.
 var allowedKeys = map[string][]string{
-	"check":  {"src", "gen", "maxgen", "expect", "stale", "maxchk"},
-	"verify": {"src", "gen", "maxgen", "stale"},
-	"bench":  {"src", "maxgen"},
+	"check":  {"src", "gen", "maxgen", "expect", "stale", "maxchk", "hash"},
+	"verify": {"src", "gen", "maxgen", "stale", "hash"},
+	"bench":  {"src", "maxgen", "hash"},
 }
 
 // allKeys is every key any shape may declare, so a key outside it is unknown
@@ -709,6 +717,7 @@ func loadProblem(id, contest, name string, values map[string]any, refs string, l
 		ID: id, Src: src, Gen: texts["gen"], MaxGen: texts["maxgen"],
 		Expect: texts["expect"], Stale: stale, MaxChk: maxchk,
 		Shape: shape, Contest: contest, TL: limits[name],
+		Registry: filepath.ToSlash(path),
 	}
 	origin[id] = filepath.ToSlash(path)
 	return nil

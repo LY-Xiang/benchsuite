@@ -117,9 +117,16 @@ func (e *Env) RunCase(p registry.Problem, spec string, seed int, timeout time.Du
 }
 
 // buildSolution compiles the candidate: gates 1 and 2.
+//
+// The binary is built beside its source, so 2267/A.cpp yields 2267/A.exe, and
+// the registry records the hash of what was compiled. A later run compares the
+// recorded hash against the source and the flags and reuses the binary when
+// they still agree.
 func (e *Env) buildSolution(work string, p registry.Problem) (string, *Result) {
-	solution := filepath.Join(work, "solution"+binarySuffix())
-	if !e.Build(filepath.Join(e.Root, filepath.FromSlash(p.Src)), solution, solutionFlags) {
+	src := filepath.Join(e.Root, filepath.FromSlash(p.Src))
+	registryPath := filepath.FromSlash(p.Registry)
+	solution, err := e.buildProduct(src, registryPath, solutionFlags)
+	if err != nil {
 		failed := result(p, "", "FAIL", "1", "solution compilation failed")
 		return "", &failed
 	}
@@ -170,8 +177,13 @@ func (e *Env) resolveReference(work string, p registry.Problem) (string, string,
 			return "", "", &failed
 		}
 	}
-	refBin := filepath.Join(work, "reference"+binarySuffix())
-	if !e.Build(refSrc, refBin, kernelFlags) {
+	// The reference is built beside its source too, so refs/2267A.cpp yields
+	// refs/2267A.exe. Its hash is recorded in the same registry table as the
+	// solution's, under the reference's own path, so the two never shadow one
+	// another.
+	registryPath := filepath.FromSlash(p.Registry)
+	refBin, err := e.buildProduct(refSrc, registryPath, kernelFlags)
+	if err != nil {
 		failed := result(p, "", "FAIL", "1", "reference compilation failed")
 		return "", "", &failed
 	}

@@ -42,6 +42,9 @@ type customGen struct {
 	// Contest is the directory of the registry that declared it, so a load error
 	// can name the table that caused it.
 	Contest string
+	// Registry is the bench.toml that declared this generator. It is where the
+	// hash of the compiled generator is recorded.
+	Registry string
 }
 
 // customGens is the process-wide table Generate consults after the built-in kinds.
@@ -57,7 +60,7 @@ func loadCustomGens(contest, path string, tables map[string]any) ([]customGen, e
 		if !ok {
 			return nil, registry.LoadErrorf("%s: gen.%s must be a table", filepath.ToSlash(path), name)
 		}
-		gen := customGen{Name: name, Contest: contest}
+		gen := customGen{Name: name, Contest: contest, Registry: filepath.ToSlash(path)}
 
 		src, _ := values["src"].(string)
 		if strings.TrimSpace(src) == "" {
@@ -113,7 +116,7 @@ func runCustomGen(env *Env, work, name string, seed int, rawParams []string) (Ge
 		return Generated{}, fmt.Errorf(
 			"generator %s is declared by a registry and needs the runner's build cache", name)
 	}
-	prog, err := env.buildCustomGen(work, gen)
+	prog, err := env.buildCustomGen(gen, filepath.FromSlash(gen.Registry))
 	if err != nil {
 		return Generated{}, err
 	}
@@ -138,9 +141,9 @@ func runCustomGen(env *Env, work, name string, seed int, rawParams []string) (Ge
 	return Generated{Input: result.Stdout, Claim: claim}, nil
 }
 
-// buildCustomGen compiles one generated program into the work directory, reusing
-// the content-addressed cache.
-func (e *Env) buildCustomGen(work string, gen customGen) (string, error) {
+// buildCustomGen compiles a generated program beside its source, so a generator
+// at 99001/gen.go yields 99001/gen.exe, with its hash recorded in the registry.
+func (e *Env) buildCustomGen(gen customGen, registryPath string) (string, error) {
 	if err := registry.CheckSrcConfined(gen.Src); err != nil {
 		return "", err
 	}
@@ -148,8 +151,8 @@ func (e *Env) buildCustomGen(work string, gen customGen) (string, error) {
 	if info, err := os.Stat(source); err != nil || info.IsDir() {
 		return "", fmt.Errorf("generator source %s is missing", text.Text(gen.Src))
 	}
-	out := filepath.Join(work, "customgen"+binarySuffix())
-	if !e.BuildGo(source, out) {
+	out, err := e.BuildGo(source, registryPath)
+	if err != nil {
 		return "", fmt.Errorf("generator source %s did not compile", text.Text(gen.Src))
 	}
 	return out, nil

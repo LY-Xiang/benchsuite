@@ -112,8 +112,11 @@ func (e *Env) RunBench(p registry.Problem) (BenchRow, error) {
 	if err := os.WriteFile(nopSrc, []byte(nopSource), 0o644); err != nil {
 		return BenchRow{}, fmt.Errorf("cannot write the launch floor: %w", err)
 	}
-	nop := filepath.Join(work, "nop"+suffix)
-	if !e.Build(nopSrc, nop, kernelFlags) {
+	// The launch floor is written fresh on every run and lives in the work
+	// directory, so it is compiled straight there rather than through the
+	// product cache: there is nothing to reuse and nothing to record.
+	nop, err := e.compileTo(nopSrc, filepath.Join(work, "nop"+suffix), kernelFlags)
+	if err != nil {
 		return BenchRow{}, fmt.Errorf("launch floor did not build")
 	}
 
