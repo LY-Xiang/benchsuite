@@ -1,0 +1,8 @@
+# The binary cache the harness fills. Entries are content-addressed and can be
+# rebuilt, so they never belong in the repository. The cache lives under the
+# corpus root the harness runs against, which is this checkout when a corpus is
+# not given.
+.bench/
+
+# A locally built harness binary.
+main.exe
