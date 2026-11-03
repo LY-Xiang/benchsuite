@@ -15,19 +15,28 @@ import (
 // rather than a content hash. A reader looking for the binary of a problem finds
 // it under the problem.
 //
-// The hash of what was compiled is recorded in the registry next to it, so the
-// next run can tell whether the binary still matches the source and the flags.
-// That record is what makes the binary a cache: without it, a stale binary would
-// be indistinguishable from a fresh one.
+// The hash of what was compiled is recorded in bench.lock, beside the registry,
+// so the next run can tell whether the binary still matches the source and the
+// flags. That record is what makes the binary a cache: without it, a stale
+// binary would be indistinguishable from a fresh one.
 //
-// This replaces a single shared directory of content-addressed entries. The
-// entries are still content-addressed -- the hash in the registry is that
-// address -- but they live where their source is, so a human can find them.
+// The lock is state the harness owns, not a declaration the author edits: it is
+// regenerated whenever the sources change, and it is not version-controlled.
+// The registry stays purely declarative, and editing a source does not dirty a
+// file a human maintains.
 
 // binaryFor returns the product path for a source: the source path with its
 // extension replaced by the platform's executable suffix.
 func binaryFor(src string) string {
 	return strings.TrimSuffix(src, filepath.Ext(src)) + binarySuffix()
+}
+
+// lockPath returns the lock file beside a registry: 2267/bench.toml is paired
+// with 2267/bench.lock.
+func lockPath(registryPath string) string {
+	dir := filepath.Dir(registryPath)
+	base := strings.TrimSuffix(filepath.Base(registryPath), filepath.Ext(registryPath))
+	return filepath.Join(dir, base+".lock")
 }
 
 // productHash is the digest of everything a compiled binary depends on: the
@@ -68,12 +77,9 @@ func normaliseNewlines(body []byte) []byte {
 // buildProduct compiles a source into the product beside it, reusing the
 // existing binary when the recorded hash still matches.
 //
-// registryPath is the registry file that records the hash; when it is empty the
-// hash is not recorded anywhere and the binary is rebuilt on every run, which is
-// what a throwaway product wants.
-//
-// The binary is written through a temporary file in the same directory and
-// renamed into place, so a concurrent run never executes a half-written binary.
+// registryPath locates the lock: the lock sits beside the registry. When it is
+// empty the hash is not recorded anywhere and the binary is rebuilt on every
+// run, which is what a throwaway product wants.
 func (e *Env) buildProduct(src, registryPath string, flags []string) (string, error) {
 	product := binaryFor(src)
 	hash, err := productHash(src, flags)
@@ -81,19 +87,24 @@ func (e *Env) buildProduct(src, registryPath string, flags []string) (string, er
 		return "", fmt.Errorf("cannot read %s: %w", src, err)
 	}
 
-	if reused, ok := e.productIntact(product, registryPath, hash); ok {
+	lock := ""
+	if registryPath != "" {
+		lock = lockPath(registryPath)
+	}
+
+	if reused, ok := e.productIntact(product, lock, hash); ok {
 		return reused, nil
 	}
 	if _, err := e.compileTo(src, product, flags); err != nil {
 		return "", err
 	}
-	if registryPath != "" {
+	if lock != "" {
 		// The binary is valid; only the record is missing, so the next run
 		// rebuilds once. That is not a build failure, but it is worth saying:
-		// a registry that cannot be updated means every run recompiles.
-		if err := recordProductHash(registryPath, e.relativeToRoot(product), hash); err != nil {
+		// a lock that cannot be updated means every run recompiles.
+		if err := recordProductHash(lock, e.relativeToRoot(product), hash); err != nil {
 			_, _ = fmt.Fprintf(os.Stderr, "bench.py: cannot record the build hash in %s: %v\n",
-				filepath.Base(registryPath), err)
+				filepath.Base(lock), err)
 		}
 	}
 	return product, nil
@@ -110,21 +121,21 @@ func (e *Env) relativeToRoot(path string) string {
 }
 
 // productIntact reports whether the product beside a source still matches the
-// hash the registry recorded.
+// hash the lock recorded.
 //
-// Three things must hold: the binary exists and is not empty, the registry
-// records a hash for it, and the recorded hash is the one this source and these
-// flags produce now. A mismatch means the source or the flags changed, so the
-// binary is stale and must be rebuilt.
-func (e *Env) productIntact(product, registryPath, want string) (string, bool) {
+// Three things must hold: the binary exists and is not empty, the lock records
+// a hash for it, and the recorded hash is the one this source and these flags
+// produce now. A mismatch means the source or the flags changed, so the binary
+// is stale and must be rebuilt.
+func (e *Env) productIntact(product, lock, want string) (string, bool) {
 	info, err := os.Stat(product)
 	if err != nil || info.IsDir() || info.Size() == 0 {
 		return "", false
 	}
-	if registryPath == "" {
+	if lock == "" {
 		return "", false
 	}
-	got, ok := readProductHash(registryPath, e.relativeToRoot(product))
+	got, ok := readProductHash(lock, e.relativeToRoot(product))
 	if !ok || got != want {
 		return "", false
 	}

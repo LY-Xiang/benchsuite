@@ -46,18 +46,17 @@ Each source is compiled to a binary beside it: `2267/A.cpp` yields `2267/A.exe`,
 and a reference at `2267/refs/2267A.cpp` yields `2267/refs/2267A.exe`. Nothing
 is built ahead of time -- the binary appears when it is first needed.
 
-The registry records the hash of what was compiled, so a later run can tell
-whether the binary still matches:
+The hash of what was compiled is recorded in `bench.lock`, beside the registry:
 
-```toml
-[A]
-maxgen = "letters %S 25"
-hash = { "2267/A.exe" = "3f2a...", "2267/refs/2267A.cpp" = "9c81..." }
+```
+2267/A.exe 3f2a...
+2267/refs/2267A.exe 9c81...
 ```
 
 The hash covers the source bytes and the compile flags, so editing either
-rebuilds the binary. The binaries are not in version control; deleting one only
-costs the next rebuild.
+rebuilds the binary. The lock and the binaries are build state the harness
+owns, not declarations a human maintains: both are gitignored, and deleting
+either only costs the next rebuild. The registry stays purely declarative.
 
 ## The three shapes
 

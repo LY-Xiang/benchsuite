@@ -281,8 +281,11 @@ func (e *Env) BuildGo(src, registryPath string) (string, error) {
 	}
 	if registryPath != "" {
 		// The generator is valid; only the record is missing, so the next run
-		// rebuilds once. That is not a build failure.
-		_ = recordProductHash(registryPath, e.relativeToRoot(product), hash)
+		// rebuilds once. That is not a build failure, but it is worth saying:
+		// a lock that cannot be updated means every run recompiles.
+		if err := recordProductHash(lockPath(registryPath), e.relativeToRoot(product), hash); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "go build: cannot record the build hash in the lock: %v\n", err)
+		}
 	}
 	return product, nil
 }
