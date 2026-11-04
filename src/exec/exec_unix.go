@@ -3,15 +3,25 @@
 package exec
 
 import (
+	"os"
 	"os/exec"
 	"syscall"
 )
+
+// jobState is the process group a child leads. Unix kills a group by addressing
+// its leader's negative pid, so there is nothing to create up front and nothing
+// to release.
+type jobState struct{}
+
+func (j *jobState) begin(*os.Process) {}
+
+func (j *jobState) end() {}
 
 func configureProcessGroup(command *exec.Cmd) {
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
-func killProcessTree(command *exec.Cmd) {
+func killProcessTree(command *exec.Cmd, _ *jobState) {
 	if command.Process == nil {
 		return
 	}

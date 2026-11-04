@@ -92,6 +92,11 @@ func (e *Env) buildProduct(src, registryPath string, flags []string) (string, er
 		lock = lockPath(registryPath)
 	}
 
+	unlock := buildLock(product)
+	defer unlock()
+
+	// Re-check under the lock: another worker may have built exactly this product
+	// while this one was reading the source and its hash.
 	if reused, ok := e.productIntact(product, lock, hash); ok {
 		return reused, nil
 	}

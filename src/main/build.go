@@ -29,6 +29,13 @@ const CompileTimeout = 5 * time.Minute
 type Env struct {
 	Root string   // repo root
 	CXX  []string // shell-split compiler command
+
+	// floorOnce compiles the launch floor at most once per process: it is the same
+	// empty program for every problem, and a sweep used to rebuild it per row.
+	floorOnce sync.Once
+	floorDir  string
+	floorBin  string
+	floorErr  error
 }
 
 func NewEnv(root string) *Env {
@@ -50,6 +57,62 @@ func binarySuffix() string {
 	}
 	return ""
 }
+
+// launchFloor compiles the empty program a timing row subtracts, once per process.
+//
+// The source and flags are identical for every problem, so a sweep of hundreds of
+// rows used to pay hundreds of identical compiles. The binary lives in a temp
+// directory owned by the Env and is removed by closeLaunchFloor when the run ends;
+// only its path is reused, never the measurement -- the floor is timed per problem
+// so both numbers of a row describe the same machine.
+func (e *Env) launchFloor() (string, error) {
+	e.floorOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "bench-floor-*")
+		if err != nil {
+			e.floorErr = fmt.Errorf("cannot create the launch floor directory: %w", err)
+			return
+		}
+		e.floorDir = dir
+		src := filepath.Join(dir, "nop.cpp")
+		if err := os.WriteFile(src, []byte(nopSource), 0o644); err != nil {
+			e.floorErr = fmt.Errorf("cannot write the launch floor: %w", err)
+			return
+		}
+		bin, err := e.compileTo(src, filepath.Join(dir, "nop"+binarySuffix()), kernelFlags)
+		if err != nil {
+			e.floorErr = fmt.Errorf("launch floor did not build")
+			return
+		}
+		e.floorBin = bin
+	})
+	return e.floorBin, e.floorErr
+}
+
+// closeLaunchFloor removes the shared launch-floor directory. It is safe to call
+// when nothing was compiled, and the process is about to exit either way.
+func (e *Env) closeLaunchFloor() {
+	if e.floorDir != "" {
+		_ = os.RemoveAll(e.floorDir)
+		e.floorDir = ""
+	}
+}
+
+// buildLock serialises builds of one product inside the process.
+//
+// Cases run in parallel, and two reps of one problem both reach the same source
+// with no recorded hash yet. Without a lock they compile it twice and the second
+// rename lands on an image the first worker is already executing, which Windows
+// refuses; even where rename succeeds, the duplicate compile is pure waste. The
+// lock is taken around the check-compile-record cycle, so the loser re-checks the
+// product and adopts the winner's binary.
+func buildLock(product string) func() {
+	value, _ := buildLocks.LoadOrStore(product, new(sync.Mutex))
+	mu := value.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+var buildLocks sync.Map // product path -> *sync.Mutex
 
 // compileTo compiles a source to an exact output path.
 //
@@ -104,7 +167,13 @@ func (e *Env) compileTo(src, out string, flags []string) (string, error) {
 // is process-wide because Build is called from three places (solution, reference,
 // generator) and none of them owns a reporting channel; the CLI drains it once at
 // the end so the notes land after the rows they belong to.
-var buildNotes []buildNote
+//
+// Cases run in parallel, so the slice is guarded: a note is appended by whichever
+// worker compiled the source, and the drain runs after every worker is joined.
+var (
+	buildNotesMu sync.Mutex
+	buildNotes   []buildNote
+)
 
 type buildNote struct {
 	src  string
@@ -119,6 +188,8 @@ type buildNote struct {
 // measurement, which is the harness inventing a failure the compiler did not
 // report. The note keeps the text instead of dropping it.
 func noteBuildOutput(src string, argv []string, stderr []byte) {
+	buildNotesMu.Lock()
+	defer buildNotesMu.Unlock()
 	buildNotes = append(buildNotes, buildNote{
 		src:  src,
 		argv: slices.Clone(argv),
@@ -128,14 +199,23 @@ func noteBuildOutput(src string, argv []string, stderr []byte) {
 
 // flushBuildNotes prints every recorded build diagnostic, indented under one
 // header per source. Nothing is printed when no build produced any.
+//
+// The notes are sorted by source path: a parallel sweep appends them in whatever
+// order the compilers finished, and an author reading the report wants the same
+// order on every run.
 func flushBuildNotes() {
-	for _, note := range buildNotes {
+	buildNotesMu.Lock()
+	notes := buildNotes
+	buildNotes = nil
+	buildNotesMu.Unlock()
+
+	slices.SortFunc(notes, func(a, b buildNote) int { return strings.Compare(a.src, b.src) })
+	for _, note := range notes {
 		reportf("%scompiled with warnings: %s\n", msgPrefix, text.Text(note.src))
 		for line := range strings.SplitSeq(strings.TrimRight(string(note.out), "\n"), "\n") {
 			reportf("  %s\n", line)
 		}
 	}
-	buildNotes = nil
 }
 
 // fileHasContent reports whether path is a file with bytes in it. Gate 2 is this
@@ -242,6 +322,8 @@ func (e *Env) BuildGo(src, registryPath string) (string, error) {
 	// The generator is built beside its source, like any other product: a
 	// generator at 99001/gen.go yields 99001/gen.exe.
 	product := binaryFor(absSrc)
+	unlock := buildLock(product)
+	defer unlock()
 	if reused, ok := e.productIntact(product, registryPath, hash); ok {
 		return reused, nil
 	}

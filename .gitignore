@@ -6,3 +6,7 @@
 
 # A locally built harness binary.
 main.exe
+.baseline/
+
+# IDE state.
+.idea/

@@ -36,7 +36,13 @@ cd <corpus>
 ```
 
 Flags: `-L check|verify|bench` (repeatable), `-R <regex>`, `--reps <n>`,
-`--timeout <seconds>`, `--junit <path>`, `--list`, `--all`, `--bench`.
+`--timeout <seconds>`, `--jobs <n>`, `--junit <path>`, `--list`, `--all`,
+`--bench`.
+
+`--jobs` bounds how many check cases run at once (default: the cores available,
+capped at 8); `--jobs 1` is the serial sweep. Timing runs under `--bench` are
+always serial and `--timeout` bounds each measured execution, so a slow solution
+refuses its row at the deadline instead of running every trial.
 
 Exit codes: `0` success, `1` a case failed, `2` a usage or registry error.
 

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // The hash of a compiled product is recorded in bench.lock, beside the registry:
@@ -27,7 +28,18 @@ import (
 // The file is rewritten atomically: the new content goes to a temporary file in
 // the same directory and is renamed over the old one, so a concurrent reader
 // sees either the whole old file or the whole new one, never a partial write.
+//
+// The read-modify-write is serialised in-process: cases build in parallel, and
+// two products of one contest finishing at once would otherwise each rewrite the
+// lock from a snapshot taken before the other's entry landed, losing one record.
+// A single mutex is enough -- a lock write costs one small file, and a build
+// dwarfs it.
+var lockMu sync.Mutex
+
 func recordProductHash(lockPath, productPath, hash string) error {
+	lockMu.Lock()
+	defer lockMu.Unlock()
+
 	entries := readLock(lockPath)
 	entries[productPath] = hash
 

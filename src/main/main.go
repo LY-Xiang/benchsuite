@@ -11,8 +11,10 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"lyxiang/benchsuite/src/registry"
@@ -47,6 +49,7 @@ type options struct {
 	junit     string
 	reps      int
 	timeout   time.Duration
+	jobs      int
 }
 
 // repoRoot is the checkout the CLI runs against: the working directory.
@@ -153,8 +156,9 @@ func run(args []string) int {
 	}
 
 	env := NewEnv(root)
+	defer env.closeLaunchFloor()
 	if opts.wantBench {
-		return runBenchMode(env, chosen)
+		return runBenchMode(env, chosen, opts.timeout)
 	}
 	return reportResults(collectResults(env, chosen, opts), opts.junit)
 }
@@ -162,7 +166,7 @@ func run(args []string) int {
 // parseArgs reads the whole command line. The returned error is a usage error:
 // run prints it and exits 2. A value-taking flag never reads past its value.
 func parseArgs(args []string) (options, error) {
-	opts := options{reps: 1}
+	opts := options{reps: 1, jobs: defaultJobs()}
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -173,7 +177,7 @@ func parseArgs(args []string) (options, error) {
 			opts.wantAll = true
 		case "--bench":
 			opts.wantBench = true
-		case "-L", "-R", "--reps", "--timeout", "--junit":
+		case "-L", "-R", "--reps", "--timeout", "--junit", "--jobs":
 			if i+1 >= len(args) {
 				return options{}, usagef("%s needs a value", arg)
 			}
@@ -221,8 +225,22 @@ func (o *options) setValueFlag(flag, value string) error {
 		o.timeout = time.Duration(seconds * float64(time.Second))
 	case "--junit":
 		o.junit = value
+	case "--jobs":
+		n, err := parseCount(value)
+		if err != nil {
+			return usagef("--jobs must be a positive integer")
+		}
+		o.jobs = n
 	}
 	return nil
+}
+
+// defaultJobs is the worker count a sweep uses when --jobs is not given. Check
+// cases are independent, so the pool is bounded by the cores rather than by the
+// case count; the cap keeps a machine with many cores from starting a compiler
+// per core, which is where peak memory would come from.
+func defaultJobs() int {
+	return min(runtime.GOMAXPROCS(0), 8)
 }
 
 // selection is what the positional arguments asked for. Three spellings are
@@ -372,7 +390,8 @@ func runList(chosen []registry.Problem) int {
 // Trailing empty columns are trimmed.
 func listLine(p registry.Problem) string {
 	return strings.TrimRight(
-		fmt.Sprintf("%s\t%s\t%s\t%s", text.Text(p.ID), text.Text(p.Shape), text.Text(p.Src), text.Text(timeLimitLabel(p))), " \t")
+		fmt.Sprintf("%s\t%s\t%s\t%s", text.Text(p.ID), text.Text(p.Shape), text.Text(p.Src), text.Text(timeLimitLabel(p))), " \t",
+	)
 }
 
 // timeLimitLabel renders the display-only time limit, if any.
@@ -384,10 +403,13 @@ func timeLimitLabel(p registry.Problem) string {
 }
 
 // runBenchMode measures each selected problem and prints a row, or a refusal.
-func runBenchMode(env *Env, chosen []registry.Problem) int {
+//
+// Timing runs stay serial: the row is a measurement, and a worker pool competing
+// for cores would report each other's scheduling jitter as the solution's cost.
+func runBenchMode(env *Env, chosen []registry.Problem, timeout time.Duration) int {
 	failed := false
 	for _, problem := range chosen {
-		row, err := env.RunBench(problem)
+		row, err := env.RunBench(problem, timeout)
 		if err != nil {
 			// The reason names the step that refused, so an author can tell a
 			// source that does not compile from a registry whose generator
@@ -407,8 +429,19 @@ func runBenchMode(env *Env, chosen []registry.Problem) int {
 // collectResults runs every selected problem at every rep, plus the extra specs
 // a problem asks for. Everything runs before anything is reported, so the summary
 // is the last line printed.
+//
+// Cases are independent, so they run across a bounded worker pool. Each case
+// writes its own result slot, so the report keeps the order a serial sweep would
+// have printed -- id order, then reps, then the largest-input and stale checks --
+// no matter which worker finished first.
 func collectResults(env *Env, chosen []registry.Problem, opts options) []Result {
-	var results []Result
+	type caseJob struct {
+		problem registry.Problem
+		spec    string
+		seed    int
+	}
+
+	var jobs []caseJob
 	for _, problem := range chosen {
 		spec := problem.Gen
 		if spec == "" {
@@ -417,17 +450,44 @@ func collectResults(env *Env, chosen []registry.Problem, opts options) []Result 
 		// The sweep, then the largest input when `maxchk` is set, then each
 		// `stale` spec under two seeds.
 		for rep := 1; rep <= opts.reps; rep++ {
-			results = append(results, env.RunCase(problem, spec, rep, opts.timeout))
+			jobs = append(jobs, caseJob{problem, spec, rep})
 		}
 		if problem.MaxChk {
-			results = append(results, env.RunCase(problem, problem.MaxGen, 1, opts.timeout))
+			jobs = append(jobs, caseJob{problem, problem.MaxGen, 1})
 		}
 		for _, stale := range problem.Stale {
-			for _, seed := range []int{1, 2} {
-				results = append(results, env.RunCase(problem, stale, seed, opts.timeout))
+			// Seeds continue past the sweep's own, so a stale spec that repeats the
+			// sweep spec does not regenerate an input the reps already produced.
+			for _, seed := range []int{opts.reps + 1, opts.reps + 2} {
+				jobs = append(jobs, caseJob{problem, stale, seed})
 			}
 		}
 	}
+
+	results := make([]Result, len(jobs))
+	workers := min(opts.jobs, len(jobs))
+	if workers <= 1 {
+		for i, job := range jobs {
+			results[i] = env.RunCase(job.problem, job.spec, job.seed, opts.timeout)
+		}
+		return results
+	}
+
+	work := make(chan int)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Go(func() {
+			for i := range work {
+				job := jobs[i]
+				results[i] = env.RunCase(job.problem, job.spec, job.seed, opts.timeout)
+			}
+		})
+	}
+	for i := range jobs {
+		work <- i
+	}
+	close(work)
+	wg.Wait()
 	return results
 }
 
@@ -465,7 +525,8 @@ func resultLine(r Result) string {
 		gate = "-"
 	}
 	return strings.TrimRight(
-		fmt.Sprintf("%-9s %s gate=%-3s %s", r.Kind, r.Problem, gate, r.Detail), " ")
+		fmt.Sprintf("%-9s %s gate=%-3s %s", r.Kind, r.Problem, gate, r.Detail), " ",
+	)
 }
 
 // parseCount accepts ASCII digits only: a count that reads as a number in one

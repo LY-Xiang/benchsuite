@@ -8,10 +8,12 @@ package exec
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"os"
 	"os/exec"
+	"sync/atomic"
 	"time"
 
 	"lyxiang/benchsuite/src/peakmem"
@@ -63,8 +65,10 @@ func run(dir string, argv []string, input []byte, captureStdout bool, timeout ti
 	if timeout <= 0 {
 		timeout = DefaultTimeout
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 
-	command := exec.Command(argv[0], argv[1:]...)
+	command := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	if dir != "" {
 		command.Dir = dir
 	}
@@ -87,6 +91,28 @@ func run(dir string, argv []string, input []byte, captureStdout bool, timeout ti
 	stderr := &limitedBuffer{limit: maxCapturedStderr}
 	command.Stderr = stderr
 	configureProcessGroup(command)
+
+	// Cancel runs when the deadline lapses before the child exits. It kills the
+	// whole tree and returns nil, so Wait then waits at most WaitDelay for the
+	// capture pipes to drain instead of letting a grandchild hold them open. A
+	// child that exits on its own never reaches it.
+	//
+	// The flag it sets is atomic. Cancel runs on exec's watchdog goroutine, and
+	// os/exec does not document which goroutine's completion makes a plain write
+	// visible to the caller after Wait; an atomic store is synchronised by
+	// construction, so the flag is correct however the wait path hands over. It is
+	// also the precise signal: the context alone would race a child that exited a
+	// moment before its deadline.
+	var timedOutFlag atomic.Bool
+	job := &jobState{}
+	command.Cancel = func() error {
+		timedOutFlag.Store(true)
+		killProcessTree(command, job)
+		return nil
+	}
+	// Without WaitDelay a grandchild holding stderr open keeps Wait blocked, so
+	// the child would control how long the harness waits.
+	command.WaitDelay = waitDelay
 	// No environment dictionary is set: children inherit the parent environment.
 	// CXX does not travel this way -- Build reads it with os.Getenv and puts it in
 	// argv, so the child never needs to see it.
@@ -97,6 +123,11 @@ func run(dir string, argv []string, input []byte, captureStdout bool, timeout ti
 		}
 		return RunResult{Code: 127, Stderr: []byte(err.Error()), PeakBytes: peakmem.Unknown}
 	}
+	// Adopted right after start: the kill can only reach descendants that already
+	// belong to the job or the process group.
+	job.begin(command.Process)
+	defer job.end()
+
 	// Opened here, not after Wait: the handle must address a live process, and the
 	// kernel keeps the high-water mark that makes one late read sufficient.
 	peak := peakmem.Unsupported()
@@ -105,23 +136,14 @@ func run(dir string, argv []string, input []byte, captureStdout bool, timeout ti
 	}
 	defer peak.Release()
 
-	// Without WaitDelay a grandchild holding stderr open keeps Wait blocked, so
-	// the child would control how long the harness waits.
-	command.WaitDelay = waitDelay
-	done := make(chan error, 1)
-	go func() { done <- command.Wait() }()
-
 	// waitErr is Wait's own verdict. A non-zero exit is not a failure here, so it
 	// is only consulted when ProcessState cannot supply a code.
-	timedOut := false
-	var waitErr error
-	select {
-	case waitErr = <-done:
-	case <-time.After(timeout):
-		timedOut = true
-		killProcessTree(command)
-		waitErr = <-done
-	}
+	waitErr := command.Wait()
+
+	// The deadline decides the timeout through the flag Cancel set, not through
+	// the context: a child that exited a moment before its deadline leaves the
+	// flag clear even if the deadline fires while Wait is returning.
+	timedOut := timedOutFlag.Load()
 
 	var stdout []byte
 	stdoutTruncated := false

@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -89,13 +88,15 @@ func formatBytes(n int64) string {
 // otherwise err says which step refused, because a bare "could not be measured"
 // leaves an author with no idea whether to fix the source, the registry or the
 // machine.
-func (e *Env) RunBench(p registry.Problem) (BenchRow, error) {
+//
+// timeout bounds each timed execution, so `--timeout` can tighten a run that would
+// otherwise sit at the default for its whole trial. Zero keeps the default.
+func (e *Env) RunBench(p registry.Problem, timeout time.Duration) (BenchRow, error) {
 	work, err := os.MkdirTemp("", "bench-time-"+p.ID+"-*")
 	if err != nil {
 		return BenchRow{}, fmt.Errorf("cannot create a work directory: %w", err)
 	}
 	defer func() { _ = os.RemoveAll(work) }()
-	suffix := binarySuffix()
 
 	// The same preparation the gate runner does: a case that would fail a gate is
 	// not one whose timing means anything.
@@ -108,27 +109,23 @@ func (e *Env) RunBench(p registry.Problem) (BenchRow, error) {
 		return BenchRow{}, fmt.Errorf("generator produced no usable input: %s", text.Text(failed.Detail))
 	}
 
-	nopSrc := filepath.Join(work, "nop.cpp")
-	if err := os.WriteFile(nopSrc, []byte(nopSource), 0o644); err != nil {
-		return BenchRow{}, fmt.Errorf("cannot write the launch floor: %w", err)
-	}
-	// The launch floor is written fresh on every run and lives in the work
-	// directory, so it is compiled straight there rather than through the
-	// product cache: there is nothing to reuse and nothing to record.
-	nop, err := e.compileTo(nopSrc, filepath.Join(work, "nop"+suffix), kernelFlags)
+	// The launch floor is the same empty program for every problem, so it is
+	// compiled once per process and reused; only the timing is per problem. Its
+	// build cost used to be paid again for each row of a sweep.
+	nop, err := e.launchFloor()
 	if err != nil {
-		return BenchRow{}, fmt.Errorf("launch floor did not build")
+		return BenchRow{}, err
 	}
 
 	// Timed in the same loop as the solution, so both see the same machine. The
 	// memory reading rides along with the timing runs rather than costing its own
 	// launches, and it is taken on the fastest trial so it belongs to the same
 	// execution the wall time came from.
-	floor, detail, ok := e.measureRuns([]string{nop}, input, "launch floor")
+	floor, detail, ok := e.measureRuns([]string{nop}, input, "launch floor", timeout)
 	if !ok {
 		return BenchRow{}, fmt.Errorf("launch floor could not be timed: %s", detail)
 	}
-	measured, detail, ok := e.measureRuns([]string{solution}, input, "solution")
+	measured, detail, ok := e.measureRuns([]string{solution}, input, "solution", timeout)
 	if !ok {
 		return BenchRow{}, fmt.Errorf("solution could not be timed: %s", detail)
 	}
@@ -167,13 +164,16 @@ type runMeasurement struct {
 // label names the program being timed and is used only to phrase the refusal, so a
 // caller can tell the launch floor apart from the solution. The detail string says
 // which run failed and how; it is empty when ok is true.
-func (e *Env) measureRuns(argv []string, input []byte, label string) (runMeasurement, string, bool) {
+//
+// timeout bounds each execution; zero keeps the exec package's default. A run that
+// hits it refuses the row at once rather than repeating it for every trial.
+func (e *Env) measureRuns(argv []string, input []byte, label string, timeout time.Duration) (runMeasurement, string, bool) {
 	best := runMeasurement{wallUs: -1, peakBytes: peakmem.Unknown}
 	for trial := 1; trial <= benchTrials; trial++ {
 		started := time.Now()
 		peak := peakmem.Unknown
 		for run := 1; run <= benchRuns; run++ {
-			result := execpkg.RunMeasured(argv, input, 0)
+			result := execpkg.RunMeasured(argv, input, timeout)
 			if result.TimedOut {
 				return runMeasurement{}, fmt.Sprintf("%s timed out (trial %d, run %d)", label, trial, run), false
 			}

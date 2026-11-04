@@ -211,7 +211,8 @@ func (e *Env) resolveReference(work string, p registry.Problem) (string, string,
 // gradeCandidate hands the solution's output to a grading reference and takes
 // its verdict: gates 4 and 7p.
 func (e *Env) gradeCandidate(p registry.Problem, shape, work, refBin, inputPath string,
-	sol execpkg.RunResult, timeout time.Duration) Result {
+	sol execpkg.RunResult, timeout time.Duration,
+) Result {
 	candidate := filepath.Join(work, "solution.txt")
 	if err := os.WriteFile(candidate, sol.Stdout, 0o644); err != nil {
 		return result(p, shape, "FAIL", "4", err.Error())
@@ -240,7 +241,8 @@ func (e *Env) gradeCandidate(p registry.Problem, shape, work, refBin, inputPath 
 // compareWithReference runs the reference on the same input and insists the two
 // agree: gates 4, 5 and 7.
 func (e *Env) compareWithReference(p registry.Problem, shape, refBin string, claimBytes, input []byte,
-	sol execpkg.RunResult, timeout time.Duration) Result {
+	sol execpkg.RunResult, timeout time.Duration,
+) Result {
 	ref := execpkg.Run([]string{refBin}, input, true, timeout)
 	if ref.TimedOut {
 		return result(p, shape, "TIMEOUT", "", "reference exceeded the case timeout")
@@ -271,10 +273,15 @@ func (e *Env) compareWithReference(p registry.Problem, shape, refBin string, cla
 	return result(p, shape, "PASS", "", "outputs match")
 }
 
+// probeTimeout bounds the `--interface` probe. The reference answers with one
+// word, so anything that has not answered by now is a wedged build rather than a
+// slow one, and the case deadline is far too generous to want here.
+const probeTimeout = 5 * time.Second
+
 // referenceInterface asks the reference what it is: `compare` or `grade`; anything
 // else is a build that cannot be trusted to grade anything.
 func (e *Env) referenceInterface(refBin string) string {
-	run := execpkg.Run([]string{refBin, "--interface"}, nil, true, 0)
+	run := execpkg.Run([]string{refBin, "--interface"}, nil, true, probeTimeout)
 	stdout := strings.ReplaceAll(string(run.Stdout), "\r\n", "\n")
 	// A probe that printed its answer then hung must not be believed: a timed-out
 	// child leaves Code at zero, so TimedOut is checked too.
