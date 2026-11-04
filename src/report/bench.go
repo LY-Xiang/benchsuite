@@ -27,8 +27,8 @@ func BenchRow(row bench.Row) string {
 	// value and a caller passing a pre-formatted one would otherwise both look
 	// correct and one would print "TL TL 3".
 	suffix := ""
-	if row.Limit != "" {
-		suffix = " TL " + row.Limit
+	if label := TimeLimit(row.Limit); label != "" {
+		suffix = " " + label
 	}
 	// cpu= is appended last and is the one addition to the row's contract: it
 	// separates real work from time spent waiting to be scheduled, which wall time

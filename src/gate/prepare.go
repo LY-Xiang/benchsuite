@@ -131,7 +131,12 @@ func (r *Runner) resolveReference(p registry.Problem) (RefKind, registry.Shape, 
 	// lies about the shape, and running anyway would compare the wrong things.
 	if (p.Shape != registry.ShapeCheck && p.Shape != registry.ShapeVerify) ||
 		kind.registryShape() != p.Shape {
-		failed := result(p, registry.ShapeUnset, VerdictFail, GateBuild,
+		// The shape is the reference's own answer here, not the registry's: the
+		// reference was found, built and answered, so the kind is known even though
+		// the two disagree. Filing this under the registry's claim would report the
+		// one value the gate just proved wrong, and would move the case's JUnit
+		// class relative to every other failure the same reference could produce.
+		failed := result(p, kind.registryShape(), VerdictFail, GateBuild,
 			"registry says "+p.Shape.String()+", reference --interface says "+kind.String())
 		return RefNone, registry.ShapeUnset, "", &failed
 	}

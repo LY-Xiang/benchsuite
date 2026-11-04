@@ -61,13 +61,21 @@ func Measure(argv []string, input []byte, floor string, timeout time.Duration,
 func campaign(argv []string, input []byte, label string, timeout time.Duration,
 	observe []execpkg.Observer,
 ) (Campaign, string, bool) {
-	var (
-		trialList []clock.Trial
+	// A trial's peak is kept beside its average, so the winner's memory can be
+	// reported with the wall time it was measured against: a row whose time came
+	// from one trial and whose memory came from another would describe two runs as
+	// one.
+	type trialPeak struct {
 		peak      int64
 		peakKnown bool
+	}
+	var (
+		trialList []clock.Trial
+		peaks     []trialPeak
 	)
 	for trial := 1; trial <= trials; trial++ {
 		samples := make([]clock.Sample, 0, runsPerTrial)
+		trialPeakValue := trialPeak{}
 		for run := 1; run <= runsPerTrial; run++ {
 			started := time.Now()
 			observed := execpkg.RunProbed(argv, input, timeout, observe...)
@@ -94,9 +102,10 @@ func campaign(argv []string, input []byte, label string, timeout time.Duration,
 				}
 				switch value := reading.(type) {
 				case mem.Peak:
-					// The largest sample across the campaign.
-					peakKnown = true
-					peak = max(peak, int64(value))
+					// The largest sample in the trial: an absent number must not be
+					// mistaken for a small one.
+					trialPeakValue.peakKnown = true
+					trialPeakValue.peak = max(trialPeakValue.peak, int64(value))
 				case mem.CPU:
 					sample.CPUKnown = true
 					sample.CPU = time.Duration(value)
@@ -111,6 +120,7 @@ func campaign(argv []string, input []byte, label string, timeout time.Duration,
 			return Campaign{}, label + " produced no usable trial", false
 		}
 		trialList = append(trialList, averaged)
+		peaks = append(peaks, trialPeakValue)
 	}
 	best, ok := clock.Best(trialList)
 	if !ok {
@@ -119,8 +129,8 @@ func campaign(argv []string, input []byte, label string, timeout time.Duration,
 	return Campaign{
 		Trials:    trialList,
 		Best:      trialList[best],
-		Peak:      peak,
-		PeakKnown: peakKnown,
+		Peak:      peaks[best].peak,
+		PeakKnown: peaks[best].peakKnown,
 	}, "", true
 }
 

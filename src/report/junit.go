@@ -3,7 +3,6 @@ package report
 import (
 	"encoding/xml"
 	"os"
-	"strings"
 
 	"github.com/LY-Xiang/benchsuite/src/gate"
 )
@@ -38,8 +37,15 @@ func JUnit(path string, results []gate.Result) (err error) {
 	for _, result := range results {
 		entry := testCase{Name: result.Problem, Classname: result.Shape.ClassName()}
 		if !result.Verdict.Passed() {
+			// A timeout has no gate id -- it was killed, not refused -- so the message
+			// is the bare word rather than "gate -": the old output read `gate` there
+			// and a CI filter matching on it must keep working.
+			message := "gate"
+			if g := result.Gate.String(); g != string(gate.GateNone) {
+				message = "gate " + g
+			}
 			entry.Failure = &failure{
-				Message: strings.TrimSpace("gate " + result.Gate.String()),
+				Message: message,
 				Text:    result.Detail,
 			}
 		}

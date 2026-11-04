@@ -268,7 +268,13 @@ func shellSplit(s string) []string {
 		}
 	}
 
-	for i := range len(s) {
+	// A classic three-clause loop, not `for i := range len(s)`: the body consumes
+	// extra bytes by advancing i inside the quote and escape branches, and a range
+	// header re-assigns i every iteration, so those advances would be undone and the
+	// escaped or quoted byte processed a second time. A CXX like
+	// `C:\msys64\mingw64\bin\g++.exe` would become `C:mmsys64...` and every
+	// compile would fail on a command that does not exist.
+	for i := 0; i < len(s); i++ {
 		switch c := s[i]; c {
 		case ' ', '\t', '\n', '\r':
 			flush()

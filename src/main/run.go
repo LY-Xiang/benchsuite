@@ -96,12 +96,7 @@ func listLine(p registry.Problem) string {
 
 // timeLimitLabel renders the display-only time limit for the --list column. The
 // label lives in report so the column and a --bench row cannot spell it two ways.
-func timeLimitLabel(p registry.Problem) string {
-	if p.TL == "" {
-		return ""
-	}
-	return "TL " + p.TL
-}
+func timeLimitLabel(p registry.Problem) string { return report.TimeLimit(p.TL) }
 
 // RunBench times one problem's solution against the empty-program launch floor,
 // always on the problem's largest input (MaxGen), since a timing row is about the
@@ -148,7 +143,7 @@ func (e *Env) RunBench(p registry.Problem, timeout time.Duration) (bench.Row, er
 	}
 	return bench.Row{
 		Problem: p.ID, Shape: p.Shape, InputBytes: len(input),
-		Limit:   timeLimitLabel(p),
+		Limit:   p.TL,
 		Reading: reading,
 	}, nil
 }
