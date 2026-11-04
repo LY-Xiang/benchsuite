@@ -14,7 +14,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 
-	"lyxiang/benchsuite/src/text"
+	"github.com/LY-Xiang/benchsuite/src/text"
 )
 
 // Lookups is what loading a registry needs to know about generator kinds.
@@ -79,7 +79,7 @@ type Problem struct {
 	Expect string // "" when absent
 	Stale  []string
 	MaxChk bool
-	Shape  string // "check" | "verify" | "bench"
+	Shape  Shape // which reference questions the harness may ask
 	// Contest is the declaring directory, which also holds its refs/. Recorded
 	// rather than re-derived from Src, which may be overridden to a bare name.
 	Contest string // "2267"
@@ -87,28 +87,6 @@ type Problem struct {
 	// Registry is the bench.toml that declared this problem. The lock holding
 	// the build hashes sits beside it.
 	Registry string
-}
-
-// allowedKeys is the key set each shape may declare. `check` is the full
-// vocabulary: a key outside every shape is unknown, one belonging only to another
-// shape is forbidden for this one.
-var allowedKeys = map[string][]string{
-	"check":  {"src", "gen", "maxgen", "expect", "stale", "maxchk"},
-	"verify": {"src", "gen", "maxgen", "stale"},
-	"bench":  {"src", "maxgen"},
-}
-
-// allKeys is every key any shape may declare, so a key outside it is unknown
-// rather than forbidden for this shape.
-var allKeys = slices.Concat(allowedKeys["check"], allowedKeys["verify"], allowedKeys["bench"])
-
-// requiredKeys is the key set each shape must declare. `maxgen` is absent from
-// every entry: it is optional now that an omitted one inherits `gen`, and a
-// problem that never runs at its ceiling should not have to invent one.
-var requiredKeys = map[string][]string{
-	"check":  {"gen", "expect"},
-	"verify": {"gen"},
-	"bench":  {"maxgen"},
 }
 
 // idRe is a contest number followed by a letter: `[C]` under `2267/` is `2267C`.
@@ -612,12 +590,14 @@ func loadProblem(id, contest, name string, values map[string]any, refs string, l
 			id, origin[id], filepath.ToSlash(path))
 	}
 
-	shape := "bench"
+	// The shape is derived from which reference file exists, so a problem with
+	// neither is timed only.
+	shape := ShapeBench
 	switch {
 	case IsFile(filepath.Join(refs, id+".verify.cpp")):
-		shape = "verify"
+		shape = ShapeVerify
 	case IsFile(filepath.Join(refs, id+".cpp")):
-		shape = "check"
+		shape = ShapeCheck
 	}
 
 	src := contest + "/" + name + ".cpp"
@@ -639,13 +619,13 @@ func loadProblem(id, contest, name string, values map[string]any, refs string, l
 		declared[key] = true
 	}
 	names := slices.Sorted(maps.Keys(values))
-	if key := firstExtra(names, allKeys); key != "" {
+	if key := firstExtra(names, ShapeAllKeys()); key != "" {
 		return LoadErrorf("%s: unknown key %s", text.Text(id), text.Quote(key))
 	}
-	if key := firstExtra(names, allowedKeys[shape]); key != "" {
-		return LoadErrorf("%s: key %s is forbidden for %s", text.Text(id), text.Quote(key), text.Text(shape))
+	if key := firstExtra(names, shape.AllowedKeys()); key != "" {
+		return LoadErrorf("%s: key %s is forbidden for %s", text.Text(id), text.Quote(key), text.Text(shape.String()))
 	}
-	if key := firstExtra(requiredKeys[shape], names); key != "" {
+	if key := firstExtra(shape.RequiredKeys(), names); key != "" {
 		return LoadErrorf("%s: missing required key %s", text.Text(id), text.Quote(key))
 	}
 
@@ -703,7 +683,7 @@ func loadProblem(id, contest, name string, values map[string]any, refs string, l
 	// reads it unconditionally (it times the worst case) and only `maxchk` asks for
 	// it otherwise, so a check or verify table may write one only when it opts in.
 	// Without this, the key reads as a tested ceiling while no case ever reaches it.
-	if declared["maxgen"] && shape != "bench" && !maxchk {
+	if declared["maxgen"] && shape != ShapeBench && !maxchk {
 		return LoadErrorf("%s: maxgen is never run without maxchk = true "+
 			"(the sweep covers gen; drop maxgen or opt into the ceiling)", id)
 	}

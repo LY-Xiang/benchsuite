@@ -56,6 +56,14 @@ type ioCounters struct {
 
 // basicLimitInformation mirrors JOBOBJECT_BASIC_LIMIT_INFORMATION. The uintptr
 // fields are SIZE_T, so the struct is sized for a 64-bit word.
+//
+// The field order is the Win32 ABI's, not Go's: it must NOT be reordered to pack
+// the booleans or shrink the padding. SetInformationJobObject reads this block by
+// offset, so moving LimitFlags off offset 16 makes the kernel read
+// MinimumWorkingSetSize's low half as the flags -- the job is then created without
+// JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE and a timed-out solution's children survive
+// the run. Test with unsafe.Offsetof if you ever touch it: LimitFlags 16,
+// ActiveProcessLimit 40, Affinity 48, size 64.
 type basicLimitInformation struct {
 	PerProcessUserTimeLimit int64
 	PerJobUserTimeLimit     int64
@@ -145,4 +153,35 @@ func killProcessTree(command *exec.Cmd, job *jobState) {
 	if command.Process != nil {
 		_ = command.Process.Kill()
 	}
+}
+
+// processObserveRights is what a reader needs to ask about a child's memory and
+// CPU accounting, and nothing more. It is the same privilege peakmem used before
+// the measurement moved out of this package, kept here because this is where the
+// handle is opened.
+const (
+	processQueryLimitedInformation = 0x1000
+	processVMRead                  = 0x0010
+)
+
+// openProcess takes the one handle every observer shares, with the rights they
+// collectively need: limited query for the counters, and PROCESS_VM_READ for the
+// memory APIs that insist on it.
+//
+// A failed open is not an error: the run proceeds and every observer reports
+// absence, which is the same answer an unsupported platform gives.
+func openProcess(pid int) Process {
+	proc := Process{PID: pid}
+	handle, _, _ := procOpenProcess.Call(
+		processQueryLimitedInformation|processVMRead, 0, uintptr(pid))
+	if handle == 0 {
+		return proc
+	}
+	proc.Handle = handle
+	proc.Release = func() {
+		// A failed close leaks one handle for the life of the process; there is no
+		// recovery, so the result is deliberately discarded.
+		_, _, _ = procCloseHandle.Call(handle)
+	}
+	return proc
 }

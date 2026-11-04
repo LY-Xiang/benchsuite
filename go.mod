@@ -1,4 +1,4 @@
-module lyxiang/benchsuite
+module github.com/LY-Xiang/benchsuite
 
 go 1.27.3
 

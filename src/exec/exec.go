@@ -15,13 +15,19 @@ import (
 	"os/exec"
 	"sync/atomic"
 	"time"
-
-	"lyxiang/benchsuite/src/peakmem"
 )
 
 // RunResult is one child process's outcome. Code is 127 when the process could
 // not be spawned at all, so a missing binary flows into the gate branches like
 // any other non-zero exit instead of needing a separate path.
+//
+// It holds no measurement. What a child used is an observer's answer and arrives
+// in Observed.Readings: this package knows a process, not a benchmark, and adding
+// a field here for every thing worth measuring would make it the benchmark's
+// struct instead of the process's.
+//
+// The bools sit at the tail so they pack into one word rather than each padding
+// its neighbours.
 type RunResult struct {
 	Stdout   []byte
 	Stderr   []byte
@@ -33,10 +39,33 @@ type RunResult struct {
 	StderrTruncated bool
 	// StdoutTruncated reports that Stdout is a prefix, not the whole answer.
 	StdoutTruncated bool
-	// PeakBytes is the child's peak resident set, or peakmem.Unknown when the
-	// platform cannot report one or the read failed. It is measured only when the
-	// caller asks, since it needs a handle held for the child's whole life.
-	PeakBytes int64
+}
+
+// A Process is a child that has just started, handed to whatever wants to observe
+// it.
+//
+// This package owns process creation, so it owns the one moment at which a handle
+// can still be taken: a measurement module opening its own handle would race the
+// child's exit. Rather than deciding here what is worth measuring, exec opens one
+// handle with every privilege a reader could need and hands it out; each module
+// then reads what it knows how to read. exec knows a process, not a benchmark.
+//
+// The handle stays valid until the child has been waited for, so every reader runs
+// after the run finishes and sees final accounting.
+type Process struct {
+	PID int
+	// Handle is the platform's own handle, already opened with the rights every
+	// reader needs. It is a HANDLE on Windows and the pid on Unix, where the
+	// accounting calls take a pid. Readers must not close it: Release does, once,
+	// after every reader has run.
+	Handle uintptr
+	// Release drops the handle. It is set by openProcess and is nil only when the
+	// child never started, which is why the caller checks it.
+	Release func()
+	// Sampler is the state a platform needs to sample a live child, for readings
+	// the OS does not keep a high-water mark for. It is nil where one late read is
+	// enough -- Windows keeps the peak in the kernel, Linux does not.
+	Sampler any
 }
 
 // Run runs a child in its own process group and kills the whole group on timeout,
@@ -48,19 +77,50 @@ func Run(argv []string, input []byte, captureStdout bool, timeout time.Duration)
 // RunIn is Run with an explicit working directory, which a Go build needs: the
 // module root decides which imports resolve. An empty dir keeps the caller's.
 func RunIn(dir string, argv []string, input []byte, captureStdout bool, timeout time.Duration) RunResult {
-	return run(dir, argv, input, captureStdout, timeout, false)
+	return run(dir, argv, input, captureStdout, timeout)
 }
 
-// RunMeasured is Run with the child's peak memory recorded as well. The handle is
-// opened while the child is alive, so the measurement is the kernel's own
-// high-water mark rather than a sample the harness happened to catch.
-func RunMeasured(argv []string, input []byte, timeout time.Duration) RunResult {
-	return run("", argv, input, false, timeout, true)
+// Observer reads one fact about a child that has already exited.
+//
+// It runs after the wait, so the child's accounting is final: a peak is the whole
+// peak, not the peak so far, and a counter has stopped. Returning false means the
+// observation did not happen -- an unsupported platform, a failed syscall, a
+// handle that no longer answers -- and the caller reports absence rather than a
+// zero it cannot defend.
+type Observer func(Process) (any, bool)
+
+// RunProbed is Run with the child exposed to observers.
+//
+// The handle is opened once, immediately after start, with every privilege a
+// reader needs; each observer then reads what it knows how to read and the handle
+// is released after the last of them. That is the point of the seam: this package
+// knows a process, and the modules that understand memory or CPU time do their own
+// reading, without each having to open a handle of its own and race the exit.
+//
+// Observers see the child only after it has exited. Nothing observes a nil Process,
+// and no observer runs when the child never started.
+func RunProbed(argv []string, input []byte, timeout time.Duration, observe ...Observer) Observed {
+	return runObserved("", argv, input, false, timeout, observe)
 }
 
-func run(dir string, argv []string, input []byte, captureStdout bool, timeout time.Duration, measurePeak bool) RunResult {
+// Observed is one probed run: the result, plus whatever each observer reported,
+// in the order the observers were given.
+type Observed struct {
+	RunResult
+	// Readings holds one entry per observer. A nil entry is an observation that
+	// did not happen; the caller checks it rather than reading a zero value.
+	Readings []any
+}
+
+func run(dir string, argv []string, input []byte, captureStdout bool, timeout time.Duration) RunResult {
+	return runObserved(dir, argv, input, captureStdout, timeout, nil).RunResult
+}
+
+func runObserved(dir string, argv []string, input []byte, captureStdout bool, timeout time.Duration,
+	observe []Observer,
+) Observed {
 	if len(argv) == 0 {
-		return RunResult{Code: 127, Stderr: []byte("no command"), PeakBytes: peakmem.Unknown}
+		return Observed{Code: 127, Stderr: []byte("no command")}
 	}
 	if timeout <= 0 {
 		timeout = DefaultTimeout
@@ -82,7 +142,7 @@ func run(dir string, argv []string, input []byte, captureStdout bool, timeout ti
 	if captureStdout {
 		file, err := os.CreateTemp("", "bench-stdout-*")
 		if err != nil {
-			return RunResult{Code: 127, Stderr: []byte(err.Error()), PeakBytes: peakmem.Unknown}
+			return Observed{Code: 127, Stderr: []byte(err.Error())}
 		}
 		defer func() { _ = os.Remove(file.Name()) }()
 		stdoutFile = file
@@ -121,20 +181,23 @@ func run(dir string, argv []string, input []byte, captureStdout bool, timeout ti
 		if stdoutFile != nil {
 			_ = stdoutFile.Close()
 		}
-		return RunResult{Code: 127, Stderr: []byte(err.Error()), PeakBytes: peakmem.Unknown}
+		return Observed{Code: 127, Stderr: []byte(err.Error())}
 	}
 	// Adopted right after start: the kill can only reach descendants that already
 	// belong to the job or the process group.
 	job.begin(command.Process)
 	defer job.end()
 
-	// Opened here, not after Wait: the handle must address a live process, and the
-	// kernel keeps the high-water mark that makes one late read sufficient.
-	peak := peakmem.Unsupported()
-	if measurePeak {
-		peak = peakmem.Begin(command.Process.Pid)
+	// Opened here, not after Wait: the handle must address a live process. The
+	// kernel keeps the high-water mark and the accounting that make one late read
+	// sufficient, so every observer runs after the wait and still sees final values.
+	proc := openProcess(command.Process.Pid)
+	if proc.Release != nil {
+		defer proc.Release()
 	}
-	defer peak.Release()
+	// The observers need what the wait produced, so the state is attached once it
+	// exists rather than at open: a platform that reads rusage gets it from here,
+	// and one that reads a handle ignores it.
 
 	// waitErr is Wait's own verdict. A non-zero exit is not a failure here, so it
 	// is only consulted when ProcessState cannot supply a code.
@@ -160,13 +223,11 @@ func run(dir string, argv []string, input []byte, captureStdout bool, timeout ti
 					code = c
 				}
 			}
-			return RunResult{
+			return Observed{
 				TimedOut:        timedOut,
 				Code:            code,
 				Stderr:          appendCaptureFailure(stderr.Bytes(), err.Error()),
-				StderrTruncated: stderr.truncated,
-				PeakBytes:       peakmem.Unknown,
-			}
+				StderrTruncated: stderr.truncated}
 		}
 	}
 
@@ -176,18 +237,11 @@ func run(dir string, argv []string, input []byte, captureStdout bool, timeout ti
 		StdoutTruncated: stdoutTruncated,
 		Stderr:          stderr.Bytes(),
 		StderrTruncated: stderr.truncated,
-		PeakBytes:       peakmem.Unknown,
-	}
-	if measurePeak {
-		if value, ok := peak.Read(); ok {
-			result.PeakBytes = value
-		}
 	}
 	if !timedOut {
 		// Wait's error covers the one case ProcessState cannot: the child left no
 		// usable status at all. Otherwise the status itself is authoritative.
-		var exitErr *exec.ExitError
-		isExit := errors.As(waitErr, &exitErr)
+		exitErr, isExit := errors.AsType[*exec.ExitError](waitErr)
 		switch {
 		case command.ProcessState != nil:
 			result.Code = command.ProcessState.ExitCode()
@@ -200,7 +254,26 @@ func run(dir string, argv []string, input []byte, captureStdout bool, timeout ti
 			result.Code = 127
 		}
 	}
-	return result
+
+	// The wait's own record goes to the observers, and only when the child was not
+	// killed. A killed child still has a ProcessState, but its rusage describes the
+	// kill rather than the work: a peak measured across a SIGKILL says nothing about
+	// what the solution needed, and a CPU time across it is the time until the
+	// deadline. The nil is what a Unix observer checks before reading.
+	if !timedOut {
+		proc.Sampler = command.ProcessState
+	}
+
+	// Observers run last, after the wait, so the accounting they read is final.
+	// Each entry is its own fact: a memory observer that failed says so without
+	// affecting a CPU observer beside it.
+	readings := make([]any, len(observe))
+	for i, observer := range observe {
+		if value, ok := observer(proc); ok {
+			readings[i] = value
+		}
+	}
+	return Observed{RunResult: result, Readings: readings}
 }
 
 // DefaultTimeout bounds one run and `--timeout` can shorten it; a

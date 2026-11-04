@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"lyxiang/benchsuite/src/text"
+	"github.com/LY-Xiang/benchsuite/src/text"
 )
 
 // isFieldName reports whether s is a bound field name: an identifier, anchored at

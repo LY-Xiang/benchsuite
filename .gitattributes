@@ -1,0 +1,5 @@
+# Normalise every text file to LF in the repository, whatever the
+# checking-out platform does. Go sources are gofmt-sensitive, and the harness
+# hashes solution sources after normalising their line endings, so a checkout
+# that flipped CRLF would churn both the diff and the build lock.
+* text=auto eol=lf

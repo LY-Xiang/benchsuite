@@ -1,4 +1,4 @@
-package main
+package gen
 
 // Registry-declared generators.
 //
@@ -9,7 +9,7 @@ package main
 //
 // and then name it in a spec like any built-in kind: `tree2 %S 100 5`.
 //
-// The source is a Go program that imports lyxiang/benchsuite/src/genlib and calls
+// The source is a Go program that imports github.com/LY-Xiang/benchsuite/src/genlib and calls
 // genlib.Main with the function that writes its input and returns its claim. That
 // is the same vocabulary a built-in kind is written in, so the two differ only in
 // where the function came from -- never in the ceiling, the claim grammar or the
@@ -30,15 +30,16 @@ import (
 	"strconv"
 	"strings"
 
-	execpkg "lyxiang/benchsuite/src/exec"
-	"lyxiang/benchsuite/src/registry"
-	"lyxiang/benchsuite/src/text"
+	"github.com/LY-Xiang/benchsuite/src/build"
+	execpkg "github.com/LY-Xiang/benchsuite/src/exec"
+	"github.com/LY-Xiang/benchsuite/src/registry"
+	"github.com/LY-Xiang/benchsuite/src/text"
 )
 
 // customGen is one registry-declared generator.
 type customGen struct {
 	Name string // the kind name a spec names
-	Src  string // repo-root relative, confined by checkSrcConfined
+	Src  string // repo-root relative, confined by CheckSrcConfined
 	// Contest is the directory of the registry that declared it, so a load error
 	// can name the table that caused it.
 	Contest string
@@ -46,11 +47,6 @@ type customGen struct {
 	// hash of the compiled generator is recorded.
 	Registry string
 }
-
-// customGens is the process-wide table Generate consults after the built-in kinds.
-// It is populated once at load, before any case runs, so a generator captured by a
-// running case is never replaced underneath it.
-var customGens = map[string]customGen{}
 
 // loadCustomGens reads the `[gen.*]` tables of one registry.
 func loadCustomGens(contest, path string, tables map[string]any) ([]customGen, error) {
@@ -87,16 +83,16 @@ func loadCustomGens(contest, path string, tables map[string]any) ([]customGen, e
 // registerCustomGens installs the generators one registry declares. A name already
 // taken by a built-in kind, or by another contest's generator at a different path,
 // is refused: either would make one spec word mean two things.
-func registerCustomGens(gens []customGen) error {
+func (r *Registry) registerCustomGens(gens []customGen) error {
 	for _, gen := range gens {
 		if _, isBuiltin := builtinKind(gen.Name); isBuiltin {
 			return registry.LoadErrorf("gen.%s collides with the built-in kind of the same name", gen.Name)
 		}
-		if prior, taken := customGens[gen.Name]; taken && prior.Src != gen.Src {
+		if prior, taken := r.customGens[gen.Name]; taken && prior.Src != gen.Src {
 			return registry.LoadErrorf("gen.%s is declared twice: %s and %s",
 				gen.Name, text.Text(prior.Src), text.Text(gen.Src))
 		}
-		customGens[gen.Name] = gen
+		r.customGens[gen.Name] = gen
 	}
 	return nil
 }
@@ -105,18 +101,18 @@ func registerCustomGens(gens []customGen) error {
 // owns nothing but its emit function: the harness passes the seed and the
 // parameters, and takes back the input on stdout and the claim from the file it
 // named, exactly as for a built-in kind.
-func runCustomGen(env *Env, work, name string, seed int, rawParams []string) (Generated, error) {
-	gen, ok := customGens[name]
+func (r *Registry) runCustomGen(c *build.Cache, work, name string, seed int, rawParams []string) (Generated, error) {
+	gen, ok := r.customGens[name]
 	if !ok {
 		return Generated{}, fmt.Errorf("unknown generator kind %q", name)
 	}
-	if env == nil {
+	if c == nil {
 		// The pure entry point has no cache or work directory to compile into, so a
 		// registry-declared generator is only reachable through a runner.
 		return Generated{}, fmt.Errorf(
 			"generator %s is declared by a registry and needs the runner's build cache", name)
 	}
-	prog, err := env.buildCustomGen(gen, filepath.FromSlash(gen.Registry))
+	prog, err := buildCustomGen(c, gen, filepath.FromSlash(gen.Registry))
 	if err != nil {
 		return Generated{}, err
 	}
@@ -126,7 +122,7 @@ func runCustomGen(env *Env, work, name string, seed int, rawParams []string) (Ge
 	argv = append(argv, prog, strconv.Itoa(seed), claimPath)
 	argv = append(argv, rawParams...)
 
-	result := execpkg.Run(argv, nil, true, CompileTimeout)
+	result := execpkg.Run(argv, nil, true, build.CompileTimeout)
 	if result.TimedOut {
 		return Generated{}, fmt.Errorf("generator %s timed out", name)
 	}
@@ -143,17 +139,17 @@ func runCustomGen(env *Env, work, name string, seed int, rawParams []string) (Ge
 
 // buildCustomGen compiles a generated program beside its source, so a generator
 // at 99001/gen.go yields 99001/gen.exe, with its hash recorded in the registry.
-func (e *Env) buildCustomGen(gen customGen, registryPath string) (string, error) {
-	if err := registry.CheckSrcConfined(gen.Src); err != nil {
+func buildCustomGen(c *build.Cache, custom customGen, registryPath string) (string, error) {
+	if err := registry.CheckSrcConfined(custom.Src); err != nil {
 		return "", err
 	}
-	source := filepath.Join(e.Root, filepath.FromSlash(gen.Src))
+	source := filepath.Join(c.Root, filepath.FromSlash(custom.Src))
 	if info, err := os.Stat(source); err != nil || info.IsDir() {
-		return "", fmt.Errorf("generator source %s is missing", text.Text(gen.Src))
+		return "", fmt.Errorf("generator source %s is missing", text.Text(custom.Src))
 	}
-	out, err := e.BuildGo(source, registryPath)
+	out, err := c.GoProduct(source, registryPath)
 	if err != nil {
-		return "", fmt.Errorf("generator source %s did not compile", text.Text(gen.Src))
+		return "", fmt.Errorf("generator source %s did not compile", text.Text(custom.Src))
 	}
 	return out, nil
 }

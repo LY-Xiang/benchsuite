@@ -10,3 +10,4 @@ main.exe
 
 # IDE state.
 .idea/
+.baseline/

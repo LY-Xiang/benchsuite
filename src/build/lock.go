@@ -1,9 +1,10 @@
-package main
+package build
 
 import (
+	"maps"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 )
@@ -44,7 +45,7 @@ func recordProductHash(lockPath, productPath, hash string) error {
 	entries[productPath] = hash
 
 	var out strings.Builder
-	for _, key := range sortedKeys(entries) {
+	for _, key := range slices.Sorted(maps.Keys(entries)) {
 		out.WriteString(key)
 		out.WriteByte(' ')
 		out.WriteString(entries[key])
@@ -69,7 +70,7 @@ func readLock(path string) map[string]string {
 		return map[string]string{}
 	}
 	entries := make(map[string]string)
-	for _, line := range strings.Split(string(raw), "\n") {
+	for line := range strings.SplitSeq(string(raw), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
@@ -81,17 +82,6 @@ func readLock(path string) map[string]string {
 		entries[key] = value
 	}
 	return entries
-}
-
-// sortedKeys returns the map keys in stable order, so the lock file does not
-// churn between runs when only one entry changed.
-func sortedKeys(entries map[string]string) []string {
-	keys := make([]string, 0, len(entries))
-	for key := range entries {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
 }
 
 // writeFileAtomic replaces a file's contents through a temporary file in the
